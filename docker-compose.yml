@@ -1,0 +1,11 @@
+services:
+  rusttp:
+    image: angrypig555/rusttp:latest
+    #volumes:
+    # - config:/root/.config/rusttp/config.toml
+    # - web:/root/www
+
+# use volumes if you want to customize the config.toml or want to put the website onto the container, you can also build in the website by building your own container
+# volumes:
+#   config:
+#   web:
