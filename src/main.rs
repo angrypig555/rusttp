@@ -19,10 +19,11 @@ struct Config {
     port: u16,
     listen_ip: String,
     web_dir: String,
+    multithreading: bool,
+    workers: u16,
 }
 
 fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
-    println!("({:?}) got connection", thread::current().id());
     let mut buffer = [0; 1024];
     let n = stream.read(&mut buffer)?;
     let request = String::from_utf8_lossy(&buffer[..n]);
@@ -38,7 +39,7 @@ fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
     let filename = if requested_path_raw == "/" { "index.html" } else { requested_path_raw.trim_start_matches('/') };
     let requested_path = Path::new(filename);
     if requested_path.components().any(|c| matches!(c, Component::ParentDir)) {
-        stream.write_all(b"HTTP/1.1 403 FORBIDDEN\r\n\r\n")?;
+        stream.write_all(b"HTTP/1.1 403 FORBIDDEN\r\nServer: rusttp/1.0\r\n\r\n")?;
         return Ok(());
     }
     let full_path = web_dir.join(requested_path);
@@ -47,7 +48,7 @@ fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
         let length = content.len();
         let mime_type = mime_guess::from_path(&full_path).first_or_octet_stream().to_string();
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {}; charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nServer: rusttp/1.0\r\nContent-Type: {}; charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             mime_type,
             length,
         );
@@ -55,7 +56,7 @@ fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
         stream.write_all(&content)?;
     
     } else {
-        stream.write_all(b"HTTP/1.1 404 NOT FOUND\r\nContent-Length: 0\r\n\r\n")?;
+        stream.write_all(b"HTTP/1.1 404 NOT FOUND\r\nServer: rusttp/1.0\r\nContent-Length: 0\r\n\r\n")?;
     }
     Ok(())
 }
@@ -90,14 +91,16 @@ fn main() -> std::io::Result<()>{
     }
     if !config_file.exists() {
         println!("config file does not exist, creating config file at ~/.config/rusttp/config.toml");
-        let default_conf = "port = 8080\nlisten_ip = \"127.0.0.1\"\nweb_dir = \"~/www\"\n";
+        let default_conf = "port = 8080\nlisten_ip = \"127.0.0.1\"\nweb_dir = \"~/www\"\nmultithreading = true\nworkers = 10\n#When not using multithreading, the workers value will be disregarded";
         fs::write(config_file, default_conf);
         println!("default configuration of \n{} has been applied", default_conf);
     }
     let conf_contents = fs::read_to_string(config_file)
         .expect("Unable to read config file");
-    let conf: Config = toml::from_str(&conf_contents).expect("Configuration file invalid");
-    println!("Loaded config\nListening on IP {}\n Port {}\n Web directory {}", conf.listen_ip, conf.port, conf.web_dir);
+    let conf: Config = toml::from_str(&conf_contents).expect("Configuration file invalid, have you tried deleting the config file?");
+    let workers = conf.workers;
+    let use_multithreading = conf.multithreading;
+    println!("Loaded config\nListening on IP {}\nPort {}\nWeb directory {}\nMultithreading {}\nWorkers {}", conf.listen_ip, conf.port, conf.web_dir, conf.multithreading, conf.workers);
     let web_dir_raw = shellexpand::tilde(&conf.web_dir);
     let web_dir = Arc::new(PathBuf::from(web_dir_raw.into_owned()));
     if !web_dir.exists() {
@@ -112,16 +115,28 @@ fn main() -> std::io::Result<()>{
     }
     
     println!("rusttp");
-    let pool = Builder::new().num_threads(10).thread_name("worker".into()).build();
-    println!("10 workers started");
+    let pool = if use_multithreading {
+        println!("{} workers started", workers);
+        Some(Builder::new().num_threads(workers.into()).thread_name("worker".into()).build())
+    } else {
+        println!("multithreading disabled");
+        None
+    };
     let combinedip = format!("{}:{}", conf.listen_ip, conf.port);
     let listener = TcpListener::bind(combinedip)?;
     for stream in listener.incoming() {
         if let Ok(mut s) = stream {
             let thread_web_dir = Arc::clone(&web_dir);
-            pool.execute(move || {
-                let _ = send_web(&mut s, &thread_web_dir);
-            });
+            match &pool {
+                Some(p) => p.execute(move || {
+                    println!("({:?}) got connection", thread::current().id());
+                    let _ = send_web(&mut s, &thread_web_dir);
+                }),
+                None => {
+                    println!("got connection");
+                    let _ = send_web(&mut s, &thread_web_dir);
+                }
+            }
         }
     }
     Ok(())
