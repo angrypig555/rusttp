@@ -7,6 +7,12 @@ use shellexpand;
 use std::process;
 use std::path::Component;
 use mime_guess;
+use std::thread;
+use std::time::Duration;
+use threadpool::ThreadPool;
+use threadpool::Builder;
+use std::sync::Arc;
+use std::path::PathBuf;
 
 #[derive(Deserialize)]
 struct Config {
@@ -16,7 +22,7 @@ struct Config {
 }
 
 fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
-    println!("got connection");
+    println!("({:?}) got connection", thread::current().id());
     let mut buffer = [0; 1024];
     let n = stream.read(&mut buffer)?;
     let request = String::from_utf8_lossy(&buffer[..n]);
@@ -93,10 +99,10 @@ fn main() -> std::io::Result<()>{
     let conf: Config = toml::from_str(&conf_contents).expect("Configuration file invalid");
     println!("Loaded config\nListening on IP {}\n Port {}\n Web directory {}", conf.listen_ip, conf.port, conf.web_dir);
     let web_dir_raw = shellexpand::tilde(&conf.web_dir);
-    let web_dir = Path::new(web_dir_raw.as_ref());
+    let web_dir = Arc::new(PathBuf::from(web_dir_raw.into_owned()));
     if !web_dir.exists() {
         println!("web directory {} does not exist, creating folder", conf.web_dir);
-        fs::create_dir_all(web_dir);
+        fs::create_dir_all(&*web_dir);
     }
     let index = web_dir.join("index.html");
     if !index.exists() {
@@ -106,11 +112,16 @@ fn main() -> std::io::Result<()>{
     }
     
     println!("rusttp");
+    let pool = Builder::new().num_threads(10).thread_name("worker".into()).build();
+    println!("10 workers started");
     let combinedip = format!("{}:{}", conf.listen_ip, conf.port);
     let listener = TcpListener::bind(combinedip)?;
     for stream in listener.incoming() {
         if let Ok(mut s) = stream {
-            let _ = send_web(&mut s, web_dir);
+            let thread_web_dir = Arc::clone(&web_dir);
+            pool.execute(move || {
+                let _ = send_web(&mut s, &thread_web_dir);
+            });
         }
     }
     Ok(())
