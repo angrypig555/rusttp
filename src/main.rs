@@ -18,6 +18,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Local;
 use std::fs::OpenOptions;
+use std::panic;
+use ctrlc;
 
 #[derive(Deserialize)]
 struct Config {
@@ -111,6 +113,39 @@ fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
 }
 
 fn main() -> std::io::Result<()>{
+    panic::set_hook(Box::new(|panic_info: &panic::PanicHookInfo| { 
+        let location = panic_info.location().map(|l| 
+            format!("in file '{}' at line {}", l.file(), l.line())
+        ).unwrap_or_else(|| "unknown location".to_string());
+
+        let payload = panic_info.payload();
+        let message = if let Some(s) = payload.downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            &s[..]
+        } else {
+            "no message provided"
+        };
+
+        log(&format!("CRASH!\n{}\n{}", location, message));
+
+        eprintln!("\nRUSTTP CRASH");
+        if let Some(path) = LOG_PATH.get() {
+            eprintln!("{} ({}), Log file: {}", message, location, path.display());
+        } else {
+            eprintln!("{} ({})", message, location);
+        }
+    }));
+    ctrlc::set_handler(move || {
+        if let Some(path) = LOG_PATH.get() {
+            println!("received ctrlc, goodbye! log can be found at {}", path.display());
+            log("Received ctrl-c, goodbye!");
+            std::process::exit(0);
+        } else {
+            println!("received ctrlc, goodbye!");
+            std::process::exit(0);
+        }
+    }).expect("Error setting ctrl-c handler");
     let placeholder_webpage = r#"
     <!DOCTYPE html>
 <html lang="en">
@@ -171,7 +206,6 @@ fn main() -> std::io::Result<()>{
         fs::write(web_dir.join("style.css"), placeholder_css)?;
         log("using placeholder page");
     }
-    
     println!("rusttp");
     let pool = if use_multithreading {
         println!("{} workers started", workers);
