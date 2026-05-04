@@ -21,6 +21,8 @@ use chrono::Utc;
 use std::fs::OpenOptions;
 use std::panic;
 use ctrlc;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 #[derive(Deserialize)]
 struct Config {
@@ -31,6 +33,8 @@ struct Config {
     workers: u16,
     logging: bool,
     log_dir: String,
+    max_requests: u64,
+    timeout_secs: u64,
 }
 
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -72,6 +76,18 @@ fn log(msg: &str) {
 
 }
 
+fn check_rate_limit(map_arc: Arc<Mutex<HashMap<String, u32>>>, ip: &str, max_req: u32) -> bool {
+    let mut map = map_arc.lock().expect("Mutex poisoned");
+    let count: &mut u32 = map.entry(ip.to_string()).or_insert(0);
+    if *count >= max_req {
+        log(&format!("rate limited {}", ip));
+        println!("ratelimited!");
+        return false;
+    }
+    *count += 1; 
+    true 
+}
+
 fn http_time() -> String {
     let now = Utc::now();
     now.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
@@ -81,7 +97,6 @@ fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
     let mut buffer = [0; 1024];
     let n = stream.read(&mut buffer)?;
     let request = String::from_utf8_lossy(&buffer[..n]);
-    log(&request);
     let request_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
@@ -131,7 +146,7 @@ fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
                         "HTTP/1.1 304 Not Modified\r\nDate: {}\r\nServer: rusttp\r\nConnection: Close\r\n\r\n",
                         http_time(),
                     );
-                    stream.write_all(response.as_bytes());
+                    stream.write_all(response.as_bytes())?;
                     return Ok(())
                 }
             }
@@ -197,6 +212,7 @@ fn main() -> std::io::Result<()>{
             std::process::exit(0);
         }
     }).expect("Error setting ctrl-c handler");
+    let rate_limit_map: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
     let placeholder_webpage = r#"
     <!DOCTYPE html>
 <html lang="en">
@@ -226,7 +242,7 @@ fn main() -> std::io::Result<()>{
     }
     if !config_file.exists() {
         println!("config file does not exist, creating config file at ~/.config/rusttp/config.toml");
-        let default_conf = "port = 8080\nlisten_ip = \"127.0.0.1\"\nweb_dir = \"~/www\"\nmultithreading = true\nworkers = 10\n#When not using multithreading, the workers value will be disregarded\nlogging = true\n log_dir = \"~/.cache/rusttp/\"\n# Log directory will be disregarded if logging is disabled";
+        let default_conf = "port = 8080\nlisten_ip = \"0.0.0.0\"\nweb_dir = \"~/www\"\nmultithreading = true\nworkers = 10\n#When not using multithreading, the workers value will be disregarded\nlogging = true\n log_dir = \"~/.cache/rusttp/\"\n# Log directory will be disregarded if logging is disabled\nmax_requests = 1000\ntimeout_secs = 60";
         fs::write(config_file, default_conf);
         println!("default configuration of \n{} has been applied", default_conf);
     }
@@ -235,13 +251,15 @@ fn main() -> std::io::Result<()>{
     let conf: Config = toml::from_str(&conf_contents).expect("Configuration file invalid, have you tried deleting the config file?");
     let workers = conf.workers;
     let use_multithreading = conf.multithreading;
-    let config_msg = format!("Loaded config\nListening on IP {}\nPort {}\nWeb directory {}\nMultithreading {}\nWorkers {}\nLogging {}\nLog Directory {}", conf.listen_ip, conf.port, conf.web_dir, conf.multithreading, conf.workers, conf.logging, conf.log_dir);
+    let config_msg = format!("Loaded config\nListening on IP {}\nPort {}\nWeb directory {}\nMultithreading {}\nWorkers {}\nLogging {}\nLog Directory {}\nMax requests {}\nTimeout for too many requests {}", conf.listen_ip, conf.port, conf.web_dir, conf.multithreading, conf.workers, conf.logging, conf.log_dir, conf.max_requests, conf.timeout_secs);
     println!("{}", &config_msg);
     if conf.logging == true {
         LOGGING_ENABLED.store(true, Ordering::Relaxed);
         log_init(&conf.log_dir);
     }
     log(&config_msg);
+    let timeout = conf.timeout_secs;
+    let max_req = conf.max_requests;
     let web_dir_raw = shellexpand::tilde(&conf.web_dir);
     let web_dir = Arc::new(PathBuf::from(web_dir_raw.into_owned()));
     if !web_dir.exists() {
@@ -269,11 +287,30 @@ fn main() -> std::io::Result<()>{
     };
     let combinedip = format!("{}:{}", conf.listen_ip, conf.port);
     let listener = TcpListener::bind(combinedip)?;
+    let janitor_map = Arc::clone(&rate_limit_map);
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(timeout));
+            let mut map = janitor_map.lock().unwrap();
+            map.clear();
+            log("rate limits reset");
+        }
+    });
     log("opening tcp listener");
     for stream in listener.incoming() {
         if let Ok(mut s) = stream {
-            let peer_ip = s.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+            let peer_ip = s.peer_addr()
+                .map(|a| a.ip().to_string()) // .ip() extracts just the IP (127.0.0.1)
+                .unwrap_or_else(|_| "unknown".to_string());
+            log(&format!("Checking rate limit for: '{}'", peer_ip));
+            let thread_rate_map = Arc::clone(&rate_limit_map);
             let thread_web_dir = Arc::clone(&web_dir);
+            if !check_rate_limit(thread_rate_map, &peer_ip, max_req as u32) {
+                        let body = format!("Too many requests, timed out for {}", timeout);
+                        let response = format!("HTTP/1.1 429 Too Many Requests\r\nDate: {}\r\nServer: rusttp\r\nRetry-After: {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", http_time(), timeout, body.len(), body);
+                        let _ = s.write_all(response.as_bytes());
+                        continue;
+            }
             match &pool {
                 Some(p) => p.execute(move || {
                     log(&format!("got connection from {}", peer_ip));
