@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use chrono::Local;
+use chrono::{DateTime, Local};
 use chrono::Utc;
 use std::fs::OpenOptions;
 use std::panic;
@@ -118,12 +118,26 @@ fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
         .map(|line| line["if-modified-since:".len()..].trim());
     let full_path = web_dir.join(requested_path);
     if full_path.exists() {
-        let content = fs::read(&full_path)?;
+       
         let metadata = fs::metadata(&full_path)?;
         let last_modified_time: chrono::DateTime<Utc> = metadata.modified()?.into();
         let last_modified_str = last_modified_time.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
         let file_time_secs = last_modified_time.timestamp();
+        if let Some(header_date) = if_modified_since {
+            if let Ok(client_date) = DateTime::parse_from_rfc2822(header_date) {
+                if file_time_secs <= client_date.timestamp() {
+                    log("304 not modified");
+                    let response = format!(
+                        "HTTP/1.1 304 Not Modified\r\nDate: {}\r\nServer: rusttp\r\nConnection: Close\r\n\r\n",
+                        http_time(),
+                    );
+                    stream.write_all(response.as_bytes());
+                    return Ok(())
+                }
+            }
+        }
         log(&format!("requested path exists, serving {} to client", &full_path.display()));
+        let content = fs::read(&full_path)?;
         let length = content.len();
         let mime_type = mime_guess::from_path(&full_path).first_or_octet_stream().to_string();
         let response = format!(
