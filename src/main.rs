@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Local;
+use chrono::Utc;
 use std::fs::OpenOptions;
 use std::panic;
 use ctrlc;
@@ -71,43 +72,79 @@ fn log(msg: &str) {
 
 }
 
+fn http_time() -> String {
+    let now = Utc::now();
+    now.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
 fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
     let mut buffer = [0; 1024];
     let n = stream.read(&mut buffer)?;
     let request = String::from_utf8_lossy(&buffer[..n]);
+    log(&request);
     let request_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return Ok(());
     }
+    let method = parts[0];
     let mut requested_path_raw = parts[1];
+
+    if method != "GET" && method != "HEAD" {
+        let response = format!(
+            "HTTP/1.1 405 Method Not Allowed\r\nDate: {}\r\nContent-Length: 0\r\nServer: rusttp\r\nAllow: GET, HEAD\r\n\r\n",
+            http_time(),
+        );
+        log("client sent post, request. 405 not allowed");
+        stream.write_all(response.as_bytes())?;
+        return Ok(())
+    }
     if requested_path_raw == "/" {
         requested_path_raw = "index.html";
     }
     let filename = if requested_path_raw == "/" { "index.html" } else { requested_path_raw.trim_start_matches('/') };
     let requested_path = Path::new(filename);
     if requested_path.components().any(|c| matches!(c, Component::ParentDir)) {
-        stream.write_all(b"HTTP/1.1 403 FORBIDDEN\r\nServer: rusttp/1.0\r\n\r\n")?;
+        let response = format!(
+            "HTTP/1.1 403 FORBIDDEN\r\nDate: {}\r\nServer: rusttp\r\n\r\n",
+            http_time(),
+        );
+        stream.write_all(response.as_bytes())?;
         log(&format!("returned 403 error, tried to access {}", requested_path.display()));
         return Ok(());
     }
+    let if_modified_since = request.lines()
+        .find(|line| line.to_lowercase().starts_with("if-modified-since:"))
+        .map(|line| line["if-modified-since:".len()..].trim());
     let full_path = web_dir.join(requested_path);
     if full_path.exists() {
         let content = fs::read(&full_path)?;
+        let metadata = fs::metadata(&full_path)?;
+        let last_modified_time: chrono::DateTime<Utc> = metadata.modified()?.into();
+        let last_modified_str = last_modified_time.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let file_time_secs = last_modified_time.timestamp();
         log(&format!("requested path exists, serving {} to client", &full_path.display()));
         let length = content.len();
         let mime_type = mime_guess::from_path(&full_path).first_or_octet_stream().to_string();
         let response = format!(
-            "HTTP/1.1 200 OK\r\nServer: rusttp/1.0\r\nContent-Type: {}; charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nDate: {}\r\nLast-Modified: {}\r\nServer: rusttp\r\nContent-Type: {}; charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            http_time(),
+            last_modified_str,
             mime_type,
             length,
         );
         stream.write_all(response.as_bytes())?;
-        stream.write_all(&content)?;
+        if method == "GET" {
+            stream.write_all(&content)?;
+        }
     
     } else {
         log(&format!("requested path does not exist, client requested {} but was not found", &full_path.display()));
-        stream.write_all(b"HTTP/1.1 404 NOT FOUND\r\nServer: rusttp/1.0\r\nContent-Length: 0\r\n\r\n")?;
+        let response = format!(
+            "HTTP/1.1 404 NOT FOUND\r\nDate: {}\r\nServer: rusttp\r\nContent-Length: 0\r\n\r\n",
+            http_time(),
+        );
+        stream.write_all(response.as_bytes())?;
     }
     Ok(())
 }
