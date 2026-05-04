@@ -100,14 +100,39 @@ fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
     let request_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nDate: {}\r\nServer: rusttp\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad request",
+            http_time(),
+        );
+        stream.write_all(response.as_bytes())?;
+        log("less than 2 parts in header, 400");
         return Ok(());
     }
     let method = parts[0];
+    let version = parts[2];
     let mut requested_path_raw = parts[1];
-
+    if version == "HTTP/1.1" {
+        log("version ok");
+    } else if version == "HTTP/1.0" ||  version == "HTTP/2.0" || version == "HTTP/3.0" { // very rare cases, should never happen but here just in case
+        let response = format!(
+            "HTTP/1.1 505 HTTP Version Not Supported\r\nDate: {}\r\nServer: rusttp\r\nContent-Type: text/plain\r\nContent-Length: 24\r\nConnection: close\r\n\r\nHTTP version unsupported",
+            http_time(),
+        );
+        log("505 not supported");
+        stream.write_all(response.as_bytes())?;
+        return Ok(())
+    } else {
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nDate: {}\r\nServer: rusttp\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad request",
+            http_time(),
+        );
+        stream.write_all(response.as_bytes())?;
+        log("bad header, 400");
+        return Ok(())
+    }
     if method != "GET" && method != "HEAD" {
         let response = format!(
-            "HTTP/1.1 405 Method Not Allowed\r\nDate: {}\r\nContent-Length: 0\r\nServer: rusttp\r\nAllow: GET, HEAD\r\n\r\n",
+            "HTTP/1.1 405 Method Not Allowed\r\nDate: {}\r\nContent-Length: 0\r\nServer: rusttp\r\nAllow: GET, HEAD\r\nConnection: close\r\n\r\n",
             http_time(),
         );
         log("client sent post, request. 405 not allowed");
@@ -121,7 +146,7 @@ fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
     let requested_path = Path::new(filename);
     if requested_path.components().any(|c| matches!(c, Component::ParentDir)) {
         let response = format!(
-            "HTTP/1.1 403 FORBIDDEN\r\nDate: {}\r\nServer: rusttp\r\n\r\n",
+            "HTTP/1.1 403 FORBIDDEN\r\nDate: {}\r\nServer: rusttp\r\nConnection: close\r\n\r\n",
             http_time(),
         );
         stream.write_all(response.as_bytes())?;
@@ -143,7 +168,7 @@ fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
                 if file_time_secs <= client_date.timestamp() {
                     log("304 not modified");
                     let response = format!(
-                        "HTTP/1.1 304 Not Modified\r\nDate: {}\r\nServer: rusttp\r\nConnection: Close\r\n\r\n",
+                        "HTTP/1.1 304 Not Modified\r\nDate: {}\r\nServer: rusttp\r\nConnection: close\r\n\r\n",
                         http_time(),
                     );
                     stream.write_all(response.as_bytes())?;
@@ -170,7 +195,7 @@ fn send_web(stream: &mut TcpStream, web_dir: &Path) -> std::io::Result<()> {
     } else {
         log(&format!("requested path does not exist, client requested {} but was not found", &full_path.display()));
         let response = format!(
-            "HTTP/1.1 404 NOT FOUND\r\nDate: {}\r\nServer: rusttp\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 404 NOT FOUND\r\nDate: {}\r\nServer: rusttp\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             http_time(),
         );
         stream.write_all(response.as_bytes())?;
